@@ -1,6 +1,6 @@
 # DS31 — Retail Demand Forecasting with Hierarchical Time Series
 
-.PHONY: all setup sample-data ingest dbt-run features baselines train reconcile evaluate app clean test help
+.PHONY: all setup sample-data ingest dbt-run features baselines train reconcile backtest evaluate app clean test help
 
 PYTHON := python
 STREAMLIT := streamlit
@@ -17,6 +17,7 @@ help:
 	@echo "  make baselines  Compute naive + statsforecast baselines"
 	@echo "  make train      Train LightGBM global model"
 	@echo "  make reconcile  Run Bottom-Up, Top-Down and MinTrace"
+	@echo "  make backtest   Evaluate on two earlier 28-day windows"
 	@echo "  make evaluate   Compute WRMSSE + per-level metrics + cost sim"
 	@echo "  make app        Launch Streamlit dashboard"
 	@echo "  make all        Run full pipeline end-to-end"
@@ -49,9 +50,14 @@ train:
 reconcile:
 	$(PYTHON) src/reconcile.py
 
+backtest:
+	$(PYTHON) src/backtest.py --window 2
+	$(PYTHON) src/backtest.py --window 1
+
 evaluate:
 	$(PYTHON) src/metrics.py
 	$(PYTHON) src/inventory_sim.py
+	$(PYTHON) src/backtest.py --summarize
 
 app:
 	$(STREAMLIT) run dashboard/app.py
@@ -59,7 +65,7 @@ app:
 test:
 	$(PYTHON) -m pytest tests/ -v
 
-all: ingest dbt-run features baselines train reconcile evaluate
+all: ingest dbt-run features baselines train reconcile backtest evaluate
 	@echo ""
 	@echo "========================================="
 	@echo " DS31 Pipeline Complete!"

@@ -5,7 +5,7 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\run_pipeline.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\run_pipeline.ps1 -Steps reconcile,evaluate
 param(
-    [string[]]$Steps = @('ingest', 'dbt-run', 'features', 'baselines', 'train', 'reconcile', 'evaluate', 'test'),
+    [string[]]$Steps = @('ingest', 'dbt-run', 'features', 'baselines', 'train', 'reconcile', 'backtest', 'evaluate', 'test'),
     [double]$MaxStepGB = 6,
     [double]$MinFreeGB = 2.5,
     # RAM + page file headroom; when this runs out Windows freezes or crashes.
@@ -26,7 +26,8 @@ $commands = [ordered]@{
     'baselines' = @('python', 'src/baselines.py')
     'train'     = @('python', "src/train_lgbm.py --history-days $HistoryDays")
     'reconcile' = @('python', 'src/reconcile.py')
-    'evaluate'  = @('python', 'src/metrics.py', 'python', 'src/inventory_sim.py')
+    'backtest'  = @('python', "src/backtest.py --window 2 --history-days $HistoryDays", 'python', "src/backtest.py --window 1 --history-days $HistoryDays")
+    'evaluate'  = @('python', 'src/metrics.py', 'python', 'src/inventory_sim.py', 'python', 'src/backtest.py --summarize')
     'test'      = @('python', '-m pytest tests/ -v')
 }
 

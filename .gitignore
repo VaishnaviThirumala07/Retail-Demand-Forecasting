@@ -52,3 +52,7 @@ reports/*.npz
 !reports/baseline_results.json
 !reports/inventory_simulation.csv
 !reports/feature_importance.csv
+!reports/wrmsse.csv
+!reports/bias_correction.json
+!reports/backtest_results.csv
+!reports/backtest_wrmsse.csv

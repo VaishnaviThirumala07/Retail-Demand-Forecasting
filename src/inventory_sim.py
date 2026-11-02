@@ -1,19 +1,20 @@
 """
 DS31 Phase 9: Inventory Cost Simulation
-Compares total cost (stockout + holding) for baseline vs LightGBM vs reconciled.
-All cost assumptions are stated explicitly.
+Compares stockout and holding cost for each forecasting method on the same dates,
+under the same policy. All cost assumptions are stated explicitly.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
+import duckdb
 import numpy as np
 import pandas as pd
 import typer
 from rich.console import Console
 from rich.table import Table
 
+from method_names import DISPLAY_METHODS
 from metrics import bottom_level
 
 console = Console()
@@ -36,7 +37,7 @@ app = typer.Typer()
 
 def order_up_to_policy(
     forecast: np.ndarray,
-    forecast_std: np.ndarray,
+    forecast_std: float,
     actuals: np.ndarray,
     z: float = SAFETY_STOCK_Z,
 ) -> dict:
@@ -45,15 +46,12 @@ def order_up_to_policy(
     Order quantity = forecast + z * forecast_std (safety stock).
     Returns total stockout and holding cost over the horizon.
 
-    Parameters
-    ----------
     forecast     : point forecasts (units), length H
-    forecast_std : forecast uncertainty (std dev per day), length H
+    forecast_std : std dev of forecast errors, from a window before the test window
     actuals      : actual demand, length H
     z            : safety stock multiplier (z-score for service level)
     """
-    safety_stock = z * np.maximum(forecast_std, 0)
-    order_qty = np.maximum(forecast + safety_stock, 0)
+    order_qty = np.maximum(forecast + z * forecast_std, 0)
 
     stockout_units = np.maximum(actuals - order_qty, 0)
     overstock_units = np.maximum(order_qty - actuals, 0)
@@ -67,67 +65,31 @@ def order_up_to_policy(
         "stockout_cost": float(stockout_cost),
         "holding_cost": float(holding_cost),
         "total_cost": float(stockout_cost + holding_cost),
-        "fill_rate": float(
-            1 - np.sum(stockout_units) / max(np.sum(actuals), 1)
-        ),
+        "fill_rate": float(1 - np.sum(stockout_units) / max(np.sum(actuals), 1)),
     }
 
 
-def load_actuals_and_forecasts() -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
-    """Load actuals and reconciled forecasts if available."""
-    recon_path = FORECASTS_DIR / "reconciled_forecasts.parquet"
-    lgbm_path = FORECASTS_DIR / "lgbm_forecasts.parquet"
-
-    recon = bottom_level(pd.read_parquet(recon_path)) if recon_path.exists() else None
-    lgbm = pd.read_parquet(lgbm_path) if lgbm_path.exists() else None
-    return recon, lgbm
-
-
-def simulate_inventory(
-    actuals_agg: pd.Series,
-    method_name: str,
-    forecast_agg: pd.Series,
-) -> dict:
-    """Run inventory simulation for one forecast method."""
-    y_true = actuals_agg.values
-    y_pred = forecast_agg.values[: len(y_true)]
-
-    # Estimate forecast std from residuals (in-sample proxy)
-    resid_std = np.std(y_pred - y_true)
-    forecast_std = np.full(len(y_pred), resid_std)
-
-    result = order_up_to_policy(y_pred, forecast_std, y_true)
-    result["method"] = method_name
-    return result
-
-
-def generate_synthetic_baseline(actuals: pd.Series) -> pd.Series:
-    """SeasonalNaive (lag-7) baseline — roll last week's actuals."""
-    vals = actuals.values
-    return pd.Series(
-        np.roll(vals, 7),
-        index=actuals.index,
-    )
+def prior_error_std(method: str) -> float:
+    """
+    Forecast error std dev from the preceding window (backtest window 1).
+    Using the test window's own errors would let each method size its safety
+    stock with knowledge of the demand it is being scored on.
+    """
+    prior = pd.read_csv(FORECASTS_DIR / "backtest_w1_daily_totals.csv")
+    return float(np.std(prior[method] - prior["actual"]))
 
 
 @app.command()
 def main(
-    warehouse: Path = typer.Option(
-        ROOT / "warehouse" / "m5.duckdb", help="DuckDB path"
-    ),
+    warehouse: Path = typer.Option(ROOT / "warehouse" / "m5.duckdb", help="DuckDB path"),
 ) -> None:
-    import duckdb
-
     REPORTS.mkdir(parents=True, exist_ok=True)
     console.print("[bold cyan]DS31 — Phase 9: Inventory Cost Simulation[/bold cyan]\n")
 
-    # Load actuals (test period)
-    con = duckdb.connect(str(warehouse), read_only=True)
+    con = duckdb.connect(str(warehouse), read_only=True, config={"memory_limit": "1GB", "threads": 2})
     actuals_df = con.execute(
         """
-        SELECT
-            sale_date AS ds,
-            SUM(units) AS y
+        SELECT sale_date AS ds, CAST(SUM(units) AS DOUBLE) AS y
         FROM raw_sales_enriched
         WHERE sale_date > (SELECT MAX(sale_date) - INTERVAL '28 days' FROM raw_sales_enriched)
           AND state_id = 'CA'
@@ -135,64 +97,31 @@ def main(
         ORDER BY ds
         """
     ).df()
-    actuals_df["ds"] = pd.to_datetime(actuals_df["ds"])
     con.close()
+    actuals_df["ds"] = pd.to_datetime(actuals_df["ds"])
+    actuals = actuals_df.set_index("ds")["y"]
 
-    actuals_series = actuals_df.set_index("ds")["y"]
+    recon = bottom_level(pd.read_parquet(FORECASTS_DIR / "reconciled_forecasts.parquet"))
+    methods = [m for m in DISPLAY_METHODS if m in recon.columns]
+    totals = recon[recon["state_id"] == "CA"].groupby("ds")[methods].sum().loc[actuals.index]
 
-    recon, lgbm = load_actuals_and_forecasts()
     results = []
+    for column in methods:
+        name = DISPLAY_METHODS[column]
+        results.append({
+            "method": name,
+            **order_up_to_policy(totals[column].to_numpy(), prior_error_std(name), actuals.to_numpy()),
+        })
 
-    # 1. Seasonal Naive baseline
-    sn_forecast = generate_synthetic_baseline(actuals_series)
-    results.append(simulate_inventory(actuals_series, "SeasonalNaive", sn_forecast))
-
-    # 2. LightGBM
-    if lgbm is not None:
-        lgbm_agg = lgbm.groupby("sale_date")["forecast"].sum()
-        lgbm_agg.index = pd.to_datetime(lgbm_agg.index)
-        # align
-        common_dates = actuals_series.index.intersection(lgbm_agg.index)
-        if len(common_dates) > 0:
-            results.append(
-                simulate_inventory(
-                    actuals_series.loc[common_dates],
-                    "LightGBM",
-                    lgbm_agg.loc[common_dates],
-                )
-            )
-
-    # 3. Reconciled methods
-    if recon is not None:
-        recon_methods = [c for c in recon.columns if c not in ("unique_id", "ds", "y")]
-        for method in recon_methods[:3]:  # limit to 3 methods
-            method_agg = recon.groupby("ds")[method].sum()
-            method_agg.index = pd.to_datetime(method_agg.index)
-            common_dates = actuals_series.index.intersection(method_agg.index)
-            if len(common_dates) > 0:
-                results.append(
-                    simulate_inventory(
-                        actuals_series.loc[common_dates],
-                        method,
-                        method_agg.loc[common_dates],
-                    )
-                )
-
-    # Display results
     tbl = Table(title="Inventory Cost Simulation (CA, 28-day test period)")
     tbl.add_column("Method", style="cyan")
-    tbl.add_column("Stockout Units", style="red")
-    tbl.add_column("Overstock Units", style="yellow")
     tbl.add_column("Stockout Cost ($)", style="red")
     tbl.add_column("Holding Cost ($)", style="yellow")
     tbl.add_column("Total Cost ($)", style="bold")
     tbl.add_column("Fill Rate", style="green")
-
     for r in results:
         tbl.add_row(
             r["method"],
-            f"{r['stockout_units']:,.0f}",
-            f"{r['overstock_units']:,.0f}",
             f"${r['stockout_cost']:,.2f}",
             f"${r['holding_cost']:,.2f}",
             f"${r['total_cost']:,.2f}",
@@ -200,20 +129,7 @@ def main(
         )
     console.print(tbl)
 
-    # Headline improvement vs seasonal naive
-    if len(results) > 1:
-        baseline_cost = results[0]["total_cost"]
-        for r in results[1:]:
-            if baseline_cost > 0:
-                pct = (baseline_cost - r["total_cost"]) / baseline_cost * 100
-                console.print(
-                    f"  {r['method']}: total cost {'reduced' if pct > 0 else 'increased'} "
-                    f"by [bold]{abs(pct):.1f}%[/bold] vs SeasonalNaive"
-                )
-
-    # Save
-    sim_df = pd.DataFrame(results)
-    sim_df.to_csv(REPORTS / "inventory_simulation.csv", index=False)
+    pd.DataFrame(results).to_csv(REPORTS / "inventory_simulation.csv", index=False)
     console.print(f"\nSimulation saved → [cyan]{REPORTS / 'inventory_simulation.csv'}[/cyan]")
 
     console.print("\n[dim]Cost assumptions:[/dim]")

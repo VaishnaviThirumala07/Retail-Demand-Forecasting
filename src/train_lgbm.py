@@ -63,8 +63,8 @@ LGBM_PARAMS = {
 app = typer.Typer()
 
 
-def load_features(history_days: int) -> pd.DataFrame:
-    """Load the last `history_days` of features with label-encoded categoricals."""
+def load_features(history_days: int, end_date: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Load `history_days` of features up to `end_date`, with label-encoded categoricals."""
     console.print(f"Loading features from [cyan]{FEATURES_PARQUET}[/cyan]…")
     numeric_cols = [c for c in FEATURE_COLS if not c.endswith("_enc")]
     cols = ", ".join(
@@ -74,10 +74,12 @@ def load_features(history_days: int) -> pd.DataFrame:
     src = f"read_parquet('{FEATURES_PARQUET.as_posix()}')"
     # DuckDB defaults to 80% of RAM and one buffer per core; cap it for laptops.
     con = duckdb.connect(config={"memory_limit": "1GB", "threads": 2})
+    end_sql = f"DATE '{end_date.date()}'" if end_date is not None else f"(SELECT MAX(sale_date) FROM {src})"
     df = con.execute(
         f"""
         SELECT {cols} FROM {src}
-        WHERE sale_date > (SELECT MAX(sale_date) FROM {src}) - INTERVAL '{history_days} days'
+        WHERE sale_date <= {end_sql}
+          AND sale_date > {end_sql} - INTERVAL '{history_days} days'
         """
     ).df()
     con.close()
@@ -113,11 +115,25 @@ def time_based_split(df: pd.DataFrame, n_folds: int = 2) -> list[tuple]:
     return folds
 
 
+def bias_factors(val_df: pd.DataFrame, val_pred: np.ndarray) -> dict:
+    """Actual / predicted ratios on the validation window: one global, one per department."""
+    frame = pd.DataFrame({
+        "dept_id": val_df["dept_id"].to_numpy(),
+        "actual": val_df["units"].to_numpy(dtype=float),
+        "pred": val_pred.astype(float),
+    })
+    by_dept = frame.groupby("dept_id")[["actual", "pred"]].sum()
+    return {
+        "global": float(frame["actual"].sum() / frame["pred"].sum()),
+        "dept": (by_dept["actual"] / by_dept["pred"]).to_dict(),
+    }
+
+
 def train_model(
     df: pd.DataFrame,
     params: dict,
     folds: list[tuple],
-) -> tuple[lgb.Booster, list[float]]:
+) -> tuple[lgb.Booster, list[float], dict]:
     """Train with early stopping on the last validation fold."""
     val_scores = []
 
@@ -158,24 +174,29 @@ def train_model(
     val_pred = model.predict(X_val)
     val_rmse = np.sqrt(np.mean((val_pred - y_val) ** 2))
     val_scores.append(val_rmse)
+    factors = bias_factors(val_df, val_pred)
 
     console.print(
         f"  Best iteration: {model.best_iteration}  |  Val RMSE: {val_rmse:.4f}  |  "
-        f"{time.time()-t0:.1f}s"
+        f"Global bias factor: {factors['global']:.4f}  |  {time.time()-t0:.1f}s"
     )
-    return model, val_scores
+    return model, val_scores, factors
 
 
-def generate_forecasts(model: lgb.Booster, test: pd.DataFrame) -> pd.DataFrame:
+def generate_forecasts(model: lgb.Booster, test: pd.DataFrame, factors: dict) -> pd.DataFrame:
     """
     Direct forecast of the held-out test window. Every lag/rolling feature is
     at least 28 days old, so each test row's features were already known at
     the forecast origin (the day before the window starts).
+    Bias factors come from the validation window, never from the test window.
     """
     console.print(f"\nForecasting held-out test window ({test['sale_date'].nunique()} days)…")
-    forecasts = test[["series_key", "item_id", "store_id", "state_id", "sale_date"]].copy()
+    forecasts = test[["series_key", "item_id", "dept_id", "store_id", "state_id", "sale_date"]].copy()
     preds = model.predict(test[FEATURE_COLS].to_numpy(dtype=np.float32))
     forecasts["forecast"] = np.clip(preds, 0, None)
+    forecasts["forecast_bc_global"] = forecasts["forecast"] * factors["global"]
+    dept_factor = forecasts["dept_id"].map(factors["dept"]).fillna(factors["global"]).astype(float)
+    forecasts["forecast_bc_dept"] = forecasts["forecast"] * dept_factor
     forecasts["horizon_day"] = (forecasts["sale_date"] - forecasts["sale_date"].min()).dt.days + 1
     console.print(f"  {len(forecasts):,} forecast rows")
     return forecasts
@@ -204,6 +225,21 @@ def log_to_mlflow(params: dict, metrics: dict, model: lgb.Booster) -> None:
     console.print("[dim]MLflow run logged.[/dim]")
 
 
+def fit_window(history_days: int, end_date: pd.Timestamp | None = None) -> tuple:
+    """Train on data before the 28-day test window that ends at `end_date` (default: latest date)."""
+    df, encoders = load_features(history_days, end_date)
+
+    test_start = df["sale_date"].max() - pd.Timedelta(days=HORIZON - 1)
+    is_test = df["sale_date"] >= test_start
+    test = df[is_test].copy()
+    df = df[~is_test]
+    console.print(f"  Held out {len(test):,} test rows from {test_start.date()}")
+
+    # Only the final fold is used (early stopping); building more just copies data.
+    model, val_scores, factors = train_model(df, LGBM_PARAMS, time_based_split(df, n_folds=1))
+    return model, encoders, test, val_scores, factors
+
+
 @app.command()
 def main(
     state: str = typer.Option("CA", help="State scope"),
@@ -213,18 +249,10 @@ def main(
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     REPORTS.mkdir(parents=True, exist_ok=True)
 
-    df, encoders = load_features(history_days)
+    model, encoders, test, val_scores, factors = fit_window(history_days)
 
-    # Hold out the last HORIZON days: these are what metrics/inventory_sim score.
-    test_start = df["sale_date"].max() - pd.Timedelta(days=HORIZON - 1)
-    is_test = df["sale_date"] >= test_start
-    test = df[is_test].copy()
-    df = df[~is_test]
-    console.print(f"  Held out {len(test):,} test rows from {test_start.date()}")
-
-    # Only the final fold is used (early stopping); building more just copies data.
-    model, val_scores = train_model(df, LGBM_PARAMS, time_based_split(df, n_folds=1))
-    del df
+    with open(REPORTS / "bias_correction.json", "w") as f:
+        json.dump(factors, f, indent=2)
 
     # Feature importance
     imp = pd.DataFrame({
@@ -242,7 +270,7 @@ def main(
     imp.to_csv(REPORTS / "feature_importance.csv", index=False)
 
     # Generate forecasts
-    forecasts = generate_forecasts(model, test)
+    forecasts = generate_forecasts(model, test, factors)
     out = ROOT / "data" / "forecasts" / "lgbm_forecasts.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
     forecasts.to_parquet(out, index=False)

@@ -1,32 +1,56 @@
 {
-  "total": {
+  "L1_total": {
     "AutoETS": 0.4575233480208073,
     "HistoricAverage": 1.762647679627608,
     "Naive": 2.0416010859844884,
     "SeasonalNaive": 0.4945738605345084
   },
-  "state": {
+  "L2_state": {
     "AutoETS": 0.4575233480208073,
     "HistoricAverage": 1.762647679627608,
     "Naive": 2.0416010859844884,
     "SeasonalNaive": 0.4945738605345084
   },
-  "store": {
+  "L3_store": {
     "AutoETS": 0.5505808174894895,
     "HistoricAverage": 1.878995655131848,
     "Naive": 1.9248398988554998,
     "SeasonalNaive": 0.5617815091491767
   },
-  "category": {
+  "L4_cat": {
     "AutoETS": 0.5078665169247285,
     "HistoricAverage": 1.7521462535930195,
     "Naive": 1.9595645437078029,
     "SeasonalNaive": 0.5453368264696973
   },
-  "dept": {
+  "L5_dept": {
     "AutoETS": 0.7171618762193527,
     "HistoricAverage": 1.9869168846427552,
     "Naive": 1.8717704943165236,
     "SeasonalNaive": 0.8291170449389824
+  },
+  "L6_state_cat": {
+    "AutoETS": 0.5078665169247285,
+    "HistoricAverage": 1.7521462535930195,
+    "Naive": 1.9595645437078029,
+    "SeasonalNaive": 0.5453368264696973
+  },
+  "L7_state_dept": {
+    "AutoETS": 0.7171618762193527,
+    "HistoricAverage": 1.9869168846427552,
+    "Naive": 1.8717704943165236,
+    "SeasonalNaive": 0.8291170449389824
+  },
+  "L8_store_cat": {
+    "AutoETS": 0.6082745709958007,
+    "HistoricAverage": 1.7478712355738173,
+    "Naive": 1.8011801673197467,
+    "SeasonalNaive": 0.6940293300044195
+  },
+  "L9_store_dept": {
+    "AutoETS": 0.787975406023606,
+    "HistoricAverage": 1.8161150610198662,
+    "Naive": 1.721500912180719,
+    "SeasonalNaive": 0.900939181927109
   }
 }

@@ -32,6 +32,12 @@ HORIZON = 28
 # days for ~12k series (23M+ rows) exhausts RAM on a 16 GB laptop.
 HISTORY_DAYS = HORIZON + 56
 
+LGBM_MODELS = {
+    "forecast": "LightGBM",
+    "forecast_bc_global": "LightGBM_BC_Global",
+    "forecast_bc_dept": "LightGBM_BC_Dept",
+}
+
 app = typer.Typer()
 
 
@@ -54,9 +60,17 @@ def build_hierarchy_spec() -> list[list[str]]:
     ]
 
 
-def load_bottom_series(con: duckdb.DuckDBPyConnection, scope_state: str) -> pd.DataFrame:
-    """Load the last HISTORY_DAYS of bottom-level (item × store) daily sales."""
+def load_bottom_series(
+    con: duckdb.DuckDBPyConnection,
+    scope_state: str,
+    end_date: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Load HISTORY_DAYS of bottom-level (item × store) daily sales up to `end_date`."""
     state_filter = f"AND state_id = '{scope_state}'" if scope_state else ""
+    end_sql = (
+        f"DATE '{end_date.date()}'" if end_date is not None
+        else "(SELECT MAX(sale_date) FROM raw_sales_enriched)"
+    )
     df = con.execute(
         f"""
         SELECT
@@ -68,8 +82,8 @@ def load_bottom_series(con: duckdb.DuckDBPyConnection, scope_state: str) -> pd.D
             sale_date AS ds,
             CAST(SUM(units) AS DOUBLE) AS y
         FROM raw_sales_enriched
-        WHERE sale_date > (SELECT MAX(sale_date) FROM raw_sales_enriched)
-                          - INTERVAL '{HISTORY_DAYS} days'
+        WHERE sale_date <= {end_sql}
+          AND sale_date > {end_sql} - INTERVAL '{HISTORY_DAYS} days'
           {state_filter}
         GROUP BY state_id, store_id, cat_id, dept_id, item_id, ds
         ORDER BY store_id, item_id, ds
@@ -103,15 +117,19 @@ def bottom_id(item_id: pd.Series, store_id: pd.Series) -> pd.Series:
     return state_id + "/" + store_id + "/" + cat_id + "/" + dept_id + "/" + item_id
 
 
+def format_lgbm_forecasts(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename LightGBM forecast columns and key them by bottom-level hierarchy id."""
+    df = df.rename(columns={"sale_date": "ds", **LGBM_MODELS})
+    df["unique_id"] = bottom_id(df["item_id"], df["store_id"])
+    df["ds"] = pd.to_datetime(df["ds"])
+    return df[["unique_id", "ds", *LGBM_MODELS.values()]]
+
+
 def load_lgbm_forecasts() -> pd.DataFrame | None:
     """Load LightGBM base forecasts if available."""
     path = FORECASTS_DIR / "lgbm_forecasts.parquet"
     if path.exists():
-        df = pd.read_parquet(path)
-        df = df.rename(columns={"sale_date": "ds", "forecast": "LightGBM"})
-        df["unique_id"] = bottom_id(df["item_id"], df["store_id"])
-        df["ds"] = pd.to_datetime(df["ds"])
-        return df[["unique_id", "ds", "LightGBM"]]
+        return format_lgbm_forecasts(pd.read_parquet(path))
     return None
 
 
@@ -138,20 +156,17 @@ def prepare_base_forecasts(
     sf = StatsForecast(models=[SeasonalNaive(season_length=7)], freq="D", n_jobs=1)
     sf.fit(train[["unique_id", "ds", "y"]])
     sn_forecasts = sf.predict(h=horizon)
-    sn_forecasts = sn_forecasts.rename(columns={"SeasonalNaive": "SeasonalNaive"})
 
     # Merge LightGBM bottom-level forecasts
     if lgbm_df is not None:
-        Y_hat = sn_forecasts.merge(
-            lgbm_df[["unique_id", "ds", "LightGBM"]],
-            on=["unique_id", "ds"],
-            how="left",
-        )
-        # Fill upper-level LightGBM column from seasonal naive
-        Y_hat["LightGBM"] = Y_hat["LightGBM"].fillna(Y_hat["SeasonalNaive"])
+        Y_hat = sn_forecasts.merge(lgbm_df, on=["unique_id", "ds"], how="left")
+        # Upper levels and any missing SKU rows use seasonal naive
+        for model in LGBM_MODELS.values():
+            Y_hat[model] = Y_hat[model].fillna(Y_hat["SeasonalNaive"])
     else:
         Y_hat = sn_forecasts.copy()
-        Y_hat["LightGBM"] = Y_hat["SeasonalNaive"]
+        for model in LGBM_MODELS.values():
+            Y_hat[model] = Y_hat["SeasonalNaive"]
 
     return Y_hat
 
@@ -185,43 +200,48 @@ def reconcile_forecasts(
     return reconciled
 
 
-def verify_coherence(reconciled: pd.DataFrame, S_df: pd.DataFrame, tags: dict) -> bool:
-    """
-    Critical test: assert that reconciled child forecasts sum to parent forecasts.
-    Uses np.allclose with tolerance 1e-4.
-    """
+def verify_coherence(reconciled: pd.DataFrame) -> bool:
+    """Assert that every reconciled method's stores and SKUs sum to the state total each day."""
     console.print("\n[bold]Coherence verification…[/bold]")
 
-    rec_cols = [c for c in reconciled.columns if "BottomUp" in c or "MinTrace" in c]
-    if not rec_cols:
-        console.print("[yellow]No reconciled columns found to verify.[/yellow]")
-        return True
-
-    col = rec_cols[0]
-    pivot = reconciled[["unique_id", "ds", col]].pivot(
-        index="ds", columns="unique_id", values=col
-    )
-
-    # Verify: bottom series sum equals total forecast for at least one date
-    level_keys = list(tags.keys())
+    depth = reconciled["unique_id"].str.count("/")
+    rec_cols = [c for c in reconciled.columns if "/" in c]
 
     all_pass = True
-    for date in pivot.index[:3]:  # spot-check 3 dates
-        bottom_ids = [uid for uid in S_df.columns]
-        # Only check if we have all bottom series
-        if not all(b in pivot.columns for b in bottom_ids[:5]):
-            console.print("  [yellow]Partial data — skipping detailed coherence check[/yellow]")
-            break
-
-        sample_bottom_sum = pivot.loc[date, bottom_ids[:5]].sum()
-        # Rough total should be positive and finite
-        if not np.isfinite(sample_bottom_sum) or sample_bottom_sum < 0:
-            console.print(f"  [red]✗ Coherence issue at {date}[/red]")
-            all_pass = False
-        else:
-            console.print(f"  [green]✓ {date}: bottom sum = {sample_bottom_sum:.1f} (finite, non-negative)[/green]")
-
+    for col in rec_cols:
+        top = reconciled[depth == 0].groupby("ds")[col].sum()
+        for level in (1, 4):
+            children = reconciled[depth == level].groupby("ds")[col].sum()
+            if not np.allclose(top, children, rtol=1e-6):
+                console.print(f"  [red]✗ {col}: level {level} does not sum to the total[/red]")
+                all_pass = False
     return all_pass
+
+
+def reconcile_window(
+    con: duckdb.DuckDBPyConnection,
+    state: str,
+    lgbm_df: pd.DataFrame | None,
+    end_date: pd.Timestamp | None = None,
+) -> tuple:
+    """Build the hierarchy up to `end_date`, then reconcile base forecasts for its last 28 days."""
+    console.print(f"Loading bottom-level series (state={state})…")
+    df = load_bottom_series(con, scope_state=state, end_date=end_date)
+    n_series = len(df[["store_id", "item_id"]].drop_duplicates())
+    console.print(f"  {n_series:,} bottom series, {len(df):,} rows")
+
+    console.print("\nBuilding summing matrix S…")
+    Y_df, S_df, tags = build_summing_matrix(df)
+    console.print(f"  {Y_df['unique_id'].nunique():,} total series across all levels")
+    for level, uids in tags.items():
+        console.print(f"    {level}: {len(uids)} series")
+
+    console.print("Preparing base forecasts for all levels…")
+    Y_hat_df = prepare_base_forecasts(Y_df, lgbm_df)
+
+    console.print("\nReconciling forecasts…")
+    reconciled = reconcile_forecasts(Y_df, Y_hat_df, S_df, tags)
+    return reconciled, S_df, tags
 
 
 def log_reconciliation_metrics(results: dict) -> None:
@@ -249,37 +269,15 @@ def main(
 
     con = duckdb.connect(str(warehouse), read_only=True, config={"memory_limit": "3GB"})
 
-    # Load bottom series and build summing matrix
-    console.print(f"Loading bottom-level series (state={state})…")
-    df = load_bottom_series(con, scope_state=state)
-    con.close()
-
-    n_series = len(df[["store_id", "item_id"]].drop_duplicates())
-    console.print(f"  {n_series:,} bottom series, {len(df):,} rows")
-
-    console.print("\nBuilding summing matrix S…")
-    Y_df, S_df, tags = build_summing_matrix(df)
-    n_total = Y_df["unique_id"].nunique()
-    console.print(f"  {n_total:,} total series across all levels")
-
-    # Log hierarchy levels
-    for level, uids in tags.items():
-        console.print(f"    {level}: {len(uids)} series")
-
     # Load LightGBM base forecasts
     lgbm_df = load_lgbm_forecasts()
     if lgbm_df is not None:
-        console.print(f"\nLoaded LightGBM forecasts ({len(lgbm_df):,} rows)")
+        console.print(f"Loaded LightGBM forecasts ({len(lgbm_df):,} rows)\n")
     else:
-        console.print("\n[yellow]LightGBM forecasts not found — using SeasonalNaive as base[/yellow]")
+        console.print("[yellow]LightGBM forecasts not found — using SeasonalNaive as base[/yellow]\n")
 
-    # Prepare base forecasts
-    console.print("Preparing base forecasts for all levels…")
-    Y_hat_df = prepare_base_forecasts(Y_df, lgbm_df)
-
-    # Reconcile
-    console.print("\nReconciling forecasts…")
-    reconciled = reconcile_forecasts(Y_df, Y_hat_df, S_df, tags)
+    reconciled, S_df, tags = reconcile_window(con, state, lgbm_df)
+    con.close()
 
     # Save
     out = FORECASTS_DIR / "reconciled_forecasts.parquet"
@@ -287,7 +285,7 @@ def main(
     console.print(f"\nReconciled forecasts saved → [cyan]{out}[/cyan]")
 
     # Verify coherence
-    coherent = verify_coherence(reconciled, S_df, tags)
+    coherent = verify_coherence(reconciled)
 
     # Save tags for later use
     tags_out = REPORTS / "hierarchy_tags.json"
@@ -299,11 +297,9 @@ def main(
     save_npz(s_out, S_df.to_csr())
     console.print(f"Summing matrix saved → [cyan]{s_out}[/cyan]")
 
-    console.print(
-        f"\n[bold {'green' if coherent else 'red'}]"
-        f"{'✓ Coherence verified' if coherent else '✗ Coherence check FAILED'}"
-        f"[/bold {'green' if coherent else 'red'}]"
-    )
+    if not coherent:
+        raise SystemExit("Coherence check failed: reconciled forecasts do not add up.")
+    console.print("\n[bold green]✓ Coherence verified[/bold green]")
 
 
 if __name__ == "__main__":
